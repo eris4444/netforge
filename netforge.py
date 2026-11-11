@@ -42,7 +42,7 @@ except ImportError:
     print("NetForge needs the 'rich' library:  sudo apt install python3-rich")
     sys.exit(1)
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 STATE_DIR = "/var/lib/netforge"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 CAPTURE_DIR = os.path.join(STATE_DIR, "captures")
