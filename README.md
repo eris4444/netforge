@@ -28,7 +28,7 @@ SSH proxy manager · Interface inspector · Packet capture · MAC changer · Mon
 ## 📦 Install
 
 ```bash
-git clone https://github.com/<your-username>/netforge.git
+git clone https://github.com/eris4444/netforge.git
 cd netforge
 sudo ./install.sh
 ```
