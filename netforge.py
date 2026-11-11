@@ -122,6 +122,7 @@ def load_state():
     st.setdefault("proxies", {})
     st.setdefault("monitor", {})
     st.setdefault("orig_mac", {})
+    st.setdefault("tunnels", {})
     return st
 
 
@@ -169,13 +170,13 @@ def header(subtitle=None):
     else:
         console.print(Align.center(Text("N E T F O R G E", style="bold bright_cyan")))
     st = load_state()
-    active = sum(1 for p in st["proxies"] if proxy_active(p))
+    tup = sum(1 for n, t in st["tunnels"].items() if tun_listening(t))
     up = sum(1 for i in list_ifaces() if read_file(f"/sys/class/net/{i}/operstate") == "up")
     info = Text.assemble(
         ("  ", ""), (f"v{VERSION}", "bold magenta"), ("  │  ", DIM),
         ("host ", DIM), (socket.gethostname(), "bold white"), ("  │  ", DIM),
         ("links up ", DIM), (str(up), "bold green"), ("  │  ", DIM),
-        ("ssh proxies ", DIM), (f"{active}/{len(st['proxies'])}", "bold cyan"), ("  │  ", DIM),
+        ("tunnels up ", DIM), (f"{tup}/{len(st['tunnels'])}", "bold cyan"), ("  │  ", DIM),
         ("monitor ", DIM), (str(len(st["monitor"])), "bold yellow" if st["monitor"] else "bold white"),
     )
     console.print(Align.center(info))
@@ -1904,6 +1905,453 @@ def ssh_menu():
 
 
 # ════════════════════════════════════════════════════════════════════
+#  6b. SSH tunnel proxies (client side: this PC → remote server)
+# ════════════════════════════════════════════════════════════════════
+
+TUN_DIR = os.path.join(STATE_DIR, "tunnels")
+TUN_KNOWN_HOSTS = os.path.join(STATE_DIR, "known_hosts")
+TUN_ASKPASS = os.path.join(STATE_DIR, "askpass.sh")
+TUN_KEY = os.path.join(STATE_DIR, "id_ed25519")
+NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+SSH = shutil.which("ssh") or "/usr/bin/ssh"
+
+
+def tun_unit(name):
+    return f"netforge-tunnel-{name}.service"
+
+
+def tun_unit_path(name):
+    return f"/etc/systemd/system/{tun_unit(name)}"
+
+
+def tun_passfile(name):
+    return os.path.join(TUN_DIR, f"{name}.pass")
+
+
+def tun_prepare():
+    os.makedirs(TUN_DIR, mode=0o700, exist_ok=True)
+    if read_file(TUN_ASKPASS) != '#!/bin/sh\ncat "$NF_PASSFILE"':
+        with open(TUN_ASKPASS, "w") as f:
+            f.write('#!/bin/sh\ncat "$NF_PASSFILE"\n')
+        os.chmod(TUN_ASKPASS, 0o700)
+
+
+def tun_ssh_opts(t):
+    o = ["-o", "StrictHostKeyChecking=accept-new", "-o", f"UserKnownHostsFile={TUN_KNOWN_HOSTS}",
+         "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
+         "-o", "LogLevel=ERROR", "-p", str(t["ssh_port"])]
+    if t["auth"] == "key":
+        o += ["-i", t["key"], "-o", "IdentitiesOnly=yes", "-o", "PasswordAuthentication=no"]
+    else:
+        o += ["-o", "PubkeyAuthentication=no", "-o", "PreferredAuthentications=password,keyboard-interactive"]
+    return o
+
+
+def tun_cmd(t):
+    flags = ["-N", "-o", "ExitOnForwardFailure=yes"]
+    if t.get("compress"):
+        flags.append("-C")
+    return [SSH] + flags + ["-D", f"{t['bind']}:{t['local_port']}"] + tun_ssh_opts(t) + [f"{t['user']}@{t['host']}"]
+
+
+def tun_env(passfile):
+    return {"SSH_ASKPASS": TUN_ASKPASS, "SSH_ASKPASS_REQUIRE": "force", "NF_PASSFILE": passfile, "DISPLAY": ":0"}
+
+
+def tun_write_unit(name, t):
+    cmd = " ".join(tun_cmd(t))
+    env = ""
+    if t["auth"] == "password":
+        env = "\n".join(f"Environment={k}={v}" for k, v in tun_env(tun_passfile(name)).items())
+    unit = f"""[Unit]
+Description=NetForge SSH tunnel {name} ({t['user']}@{t['host']} -> socks {t['bind']}:{t['local_port']})
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+{env}
+ExecStart={cmd}
+StandardInput=null
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"""
+    with open(tun_unit_path(name), "w") as f:
+        f.write(unit)
+    os.chmod(tun_unit_path(name), 0o600)
+    run(["systemctl", "daemon-reload"])
+
+
+def tun_listening(t):
+    with socket.socket() as s:
+        s.settimeout(0.5)
+        host = "127.0.0.1" if t["bind"] in ("0.0.0.0", "127.0.0.1") else t["bind"]
+        return s.connect_ex((host, int(t["local_port"]))) == 0
+
+
+def tun_status(name, t):
+    if not svc_active(tun_unit(name)):
+        return "stopped"
+    return "up" if tun_listening(t) else "connecting"
+
+
+def tun_test(t, quiet=False):
+    host = "127.0.0.1" if t["bind"] in ("0.0.0.0", "127.0.0.1") else t["bind"]
+    t0 = time.time()
+    rc, out, _ = run(["curl", "-s", "--max-time", "12", "--socks5-hostname", f"{host}:{t['local_port']}",
+                      "https://api.ipify.org"], timeout=15)
+    ms = (time.time() - t0) * 1000
+    out = out.strip()
+    try:
+        ipaddress.ip_address(out)
+    except ValueError:
+        if not quiet:
+            err("Request through the proxy failed")
+        return None, None
+    if not quiet:
+        ok(f"Proxy works – exit IP [bold green]{out}[/]  latency [bold yellow]{ms:.0f} ms[/]")
+    return out, ms
+
+
+def tun_start(name, t, wait=20):
+    run(["systemctl", "enable", tun_unit(name)])
+    run(["systemctl", "restart", tun_unit(name)])
+    with console.status(f"[bold cyan]Connecting {t['user']}@{t['host']}:{t['ssh_port']} ...", spinner="dots12"):
+        for _ in range(wait * 2):
+            time.sleep(0.5)
+            if tun_listening(t):
+                break
+    if tun_listening(t):
+        ok(f"Tunnel [bold]{name}[/] is UP → SOCKS5 [bold cyan]{t['bind']}:{t['local_port']}[/]")
+        return True
+    err("Tunnel did not come up. Last log lines:")
+    rc, out, _ = run(["journalctl", "-u", tun_unit(name), "-n", "8", "--no-pager", "-o", "cat"])
+    console.print(Text(out.strip() or "(no log)", style="red"))
+    hint = out.lower()
+    if "permission denied" in hint:
+        warn("Wrong username / password / key")
+    elif "host key verification failed" in hint or "remote host identification has changed" in hint:
+        warn("Server host key changed – use 'Forget host key' in the tunnel menu")
+    elif "address already in use" in hint:
+        warn("Local port is busy – pick another local port")
+    return False
+
+
+def tun_stop(name):
+    run(["systemctl", "disable", "--now", tun_unit(name)])
+
+
+def tun_usage_panel(t):
+    host = "127.0.0.1" if t["bind"] in ("0.0.0.0", "127.0.0.1") else t["bind"]
+    p = t["local_port"]
+    lines = [
+        Text.assemble(("SOCKS5 proxy  ", f"bold {ACCENT}"), (f"{host}:{p}", "bold white"), ("   (no username / password)", DIM)),
+        Text(""),
+        Text("Terminal (one command):", style=f"bold {ACCENT2}"),
+        Text(f"  curl --socks5-hostname {host}:{p} https://api.ipify.org", style="cyan"),
+        Text("Terminal (whole session):", style=f"bold {ACCENT2}"),
+        Text(f"  export ALL_PROXY=socks5h://{host}:{p}      # undo:  unset ALL_PROXY", style="cyan"),
+        Text("Firefox:", style=f"bold {ACCENT2}"),
+        Text(f"  Settings → Network → Manual proxy → SOCKS Host {host}  Port {p}", style="cyan"),
+        Text("  SOCKS v5  +  ✔ Proxy DNS when using SOCKS v5", style="cyan"),
+        Text("Chromium:", style=f"bold {ACCENT2}"),
+        Text(f"  chromium --proxy-server=\"socks5://{host}:{p}\"", style="cyan"),
+    ]
+    if t["bind"] == "0.0.0.0":
+        lines += [Text("Other devices on your LAN (phone, laptop):", style=f"bold {ACCENT2}"),
+                  Text(f"  SOCKS5  {local_ip()}:{p}", style="cyan")]
+    return Panel(Group(*lines), title="[bold green]How to use[/]", border_style="green", padding=(1, 2))
+
+
+def tun_ask_auth(t, name):
+    """Ask auth method; writes password file if needed. Returns True if ok."""
+    c = menu_inline([("1", "Password"), ("2", "SSH key file"), ("3", "NetForge key (auto-installed on server)")])
+    if c == "1":
+        pw = ask("Server SSH password", password=True)
+        if not pw:
+            err("Empty password")
+            return False
+        fd = os.open(tun_passfile(name), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(pw)
+        t["auth"], t["key"] = "password", None
+        return True
+    if c == "2":
+        home = os.path.expanduser(f"~{os.environ.get('SUDO_USER', 'root')}")
+        default = next((os.path.join(home, ".ssh", k) for k in ("id_ed25519", "id_rsa", "id_ecdsa")
+                        if os.path.exists(os.path.join(home, ".ssh", k))), os.path.join(home, ".ssh", "id_ed25519"))
+        key = ask("Private key path", default=default)
+        if not os.path.isfile(key):
+            err("Key file not found")
+            return False
+        t["auth"], t["key"] = "key", key
+        return True
+    # NetForge key: generate once, copy to server using the password
+    if not os.path.exists(TUN_KEY):
+        run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "netforge", "-f", TUN_KEY])
+    pw = ask("Server SSH password (used once to install the key)", password=True)
+    with tempfile.TemporaryDirectory() as td:
+        pf = os.path.join(td, "p")
+        fd = os.open(pf, os.O_WRONLY | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(pw)
+        tmp = dict(t, auth="password")
+        cmd = ["ssh-copy-id", "-i", TUN_KEY + ".pub"] + tun_ssh_opts(tmp) + [f"{t['user']}@{t['host']}"]
+        with console.status("[bold cyan]Installing key on server ...", spinner="dots"):
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
+                               env=dict(os.environ, **tun_env(pf)))
+    if p.returncode != 0:
+        err(f"Could not install key: {(p.stderr or p.stdout).strip()[-300:]}")
+        return False
+    ok("Key installed on server – no password needed from now on")
+    t["auth"], t["key"] = "key", TUN_KEY
+    return True
+
+
+def tun_create():
+    header("New SSH Tunnel Proxy")
+    tun_prepare()
+    st = load_state()
+    while True:
+        name = ask("Tunnel name (e.g. germany1)")
+        if not NAME_RE.match(name):
+            err("Use letters, digits, - and _ only")
+        elif name in st["tunnels"]:
+            err("Name already exists")
+        else:
+            break
+    t = {"host": ask("Server address (IP or domain)")}
+    t["ssh_port"] = ask_int("Server SSH port", default=22, lo=1, hi=65535)
+    t["user"] = ask("Server username", default="root")
+    used = {int(x["local_port"]) for x in st["tunnels"].values()}
+    suggest = next(p for p in range(1080, 65000) if p not in used and not port_in_use(p))
+    while True:
+        lp = ask_int("Local SOCKS port on this PC", default=suggest, lo=1, hi=65535)
+        if lp in used:
+            err("Another tunnel uses this port")
+        elif port_in_use(lp):
+            err("Port is busy on this system")
+        else:
+            break
+    t["local_port"] = lp
+    t["bind"] = "0.0.0.0" if confirm("Share the proxy with other devices on your LAN?", False) else "127.0.0.1"
+    t["compress"] = confirm("Enable compression (helps on slow links)?", False)
+    t["created"] = dt.datetime.now().isoformat(timespec="seconds")
+    if not tun_ask_auth(t, name):
+        try:
+            os.remove(tun_passfile(name))
+        except OSError:
+            pass
+        return pause()
+    st = load_state()
+    st["tunnels"][name] = t
+    save_state(st)
+    tun_write_unit(name, t)
+    if tun_start(name, t):
+        tun_test(t)
+        console.print(tun_usage_panel(t))
+    else:
+        warn("Saved anyway – fix the settings from 'Manage tunnel' (it keeps retrying every 5s)")
+    pause()
+
+
+def tun_delete(name, ask_confirm=True):
+    if ask_confirm and not confirm(f"Delete tunnel {name}?"):
+        return
+    tun_stop(name)
+    for f in (tun_unit_path(name), tun_passfile(name)):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    run(["systemctl", "daemon-reload"])
+    st = load_state()
+    st["tunnels"].pop(name, None)
+    save_state(st)
+    ok(f"Tunnel {name} deleted")
+
+
+def tun_manage(name):
+    while True:
+        st = load_state()
+        t = st["tunnels"].get(name)
+        if not t:
+            return
+        header(f"Tunnel — {name}")
+        s = tun_status(name, t)
+        g = Table.grid(padding=(0, 2))
+        g.add_column(style=f"bold {ACCENT}", justify="right")
+        g.add_column(style="white")
+        g.add_row("Status", Text(s.upper(), style={"up": "bold green", "connecting": "bold yellow"}.get(s, "bold red")))
+        g.add_row("Server", f"{t['user']}@{t['host']}:{t['ssh_port']}")
+        g.add_row("Auth", t["auth"] + (f" ({t['key']})" if t.get("key") else ""))
+        g.add_row("SOCKS5", Text(f"{t['bind']}:{t['local_port']}", style="bold cyan"))
+        g.add_row("Compression", "on" if t.get("compress") else "off")
+        g.add_row("Created", t.get("created", "-").replace("T", " "))
+        console.print(Align.center(Panel(g, border_style=ACCENT, title=f"[bold]{name}[/]", padding=(1, 3))))
+        c = menu_inline([("1", "Start/Reconnect"), ("2", "Stop"), ("3", "Test"), ("4", "How to use"),
+                         ("5", "Change local port"), ("6", "Change auth"), ("7", "LAN sharing on/off"),
+                         ("8", "Forget host key"), ("l", "Logs"), ("x", "Delete"), ("0", "Back")])
+        if c == "0":
+            return
+        if c == "1":
+            tun_start(name, t)
+        elif c == "2":
+            tun_stop(name)
+            ok("Stopped")
+        elif c == "3":
+            if tun_status(name, t) != "up":
+                err("Tunnel is not up")
+            else:
+                with console.status("[bold cyan]Testing ...", spinner="dots"):
+                    ip, ms = tun_test(t, quiet=True)
+                if ip:
+                    ok(f"Proxy works – exit IP [bold green]{ip}[/]  latency [bold yellow]{ms:.0f} ms[/]")
+                else:
+                    err("Request through the proxy failed")
+        elif c == "4":
+            console.print(tun_usage_panel(t))
+        elif c in ("5", "6", "7"):
+            if c == "5":
+                lp = ask_int("New local port", default=t["local_port"], lo=1, hi=65535)
+                if lp != t["local_port"] and port_in_use(lp):
+                    err("Port is busy")
+                    pause()
+                    continue
+                t["local_port"] = lp
+            elif c == "6":
+                t["user"] = ask("Server username", default=t["user"])
+                if not tun_ask_auth(t, name):
+                    pause()
+                    continue
+                if t["auth"] == "key":
+                    try:
+                        os.remove(tun_passfile(name))
+                    except OSError:
+                        pass
+            else:
+                t["bind"] = "127.0.0.1" if t["bind"] == "0.0.0.0" else "0.0.0.0"
+                info(f"Bind address → {t['bind']}")
+            st = load_state()
+            st["tunnels"][name] = t
+            save_state(st)
+            tun_write_unit(name, t)
+            tun_start(name, t)
+        elif c == "8":
+            run(["ssh-keygen", "-R", f"[{t['host']}]:{t['ssh_port']}" if t["ssh_port"] != 22 else t["host"],
+                 "-f", TUN_KNOWN_HOSTS])
+            ok("Host key forgotten – the new key will be accepted on next connect")
+        elif c == "l":
+            rc, out, _ = run(["journalctl", "-u", tun_unit(name), "-n", "30", "--no-pager", "-o", "short-iso"])
+            console.print(Text(out.strip() or "(no log)", style=DIM))
+        elif c == "x":
+            tun_delete(name)
+            pause()
+            return
+        pause()
+
+
+def external_tunnels():
+    """ssh -D processes not managed by NetForge (e.g. started by hand)."""
+    rc, out, _ = run(["ps", "-eo", "pid=,user=,args="])
+    res = []
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, user, args = parts
+        a = args.split()
+        if a and os.path.basename(a[0]) == "ssh" and any(x.startswith("-D") or x == "-D" for x in a) \
+                and TUN_KNOWN_HOSTS not in args:
+            res.append((pid, user, args))
+    return res
+
+
+def tun_table():
+    st = load_state()
+    t = Table(box=box.ROUNDED, border_style=ACCENT, header_style=f"bold {ACCENT2}")
+    for c in ["#", "Name", "Status", "SOCKS5 (local)", "Server", "Auth", "LAN"]:
+        t.add_column(c)
+    names = sorted(st["tunnels"])
+    for i, n in enumerate(names, 1):
+        x = st["tunnels"][n]
+        s = tun_status(n, x)
+        t.add_row(str(i), Text(n, style="bold white"),
+                  Text("● " + s.upper(), style={"up": "bold green", "connecting": "bold yellow"}.get(s, "bold red")),
+                  Text(f"127.0.0.1:{x['local_port']}", style="bold cyan"),
+                  f"{x['user']}@{x['host']}:{x['ssh_port']}", x["auth"],
+                  "yes" if x["bind"] == "0.0.0.0" else "-")
+    return t, names
+
+
+def tunnels_menu():
+    while True:
+        header("SSH Tunnel Proxies")
+        t, names = tun_table()
+        if names:
+            console.print(Align.center(t))
+        else:
+            console.print(Align.center(Text("No tunnels yet – create one with [1]", style="yellow")))
+        ext = external_tunnels()
+        if ext:
+            console.print(Align.center(Text(f"⚠ {len(ext)} manual ssh -D tunnel(s) running outside NetForge (see [6])",
+                                            style="yellow")))
+        c = menu_inline([("1", "New tunnel"), ("2", "Manage"), ("3", "Start all"), ("4", "Stop all"),
+                         ("5", "Test all"), ("6", "Manual ssh -D tunnels"), ("h", "Host SSH server mode"),
+                         ("0", "Back")], color="green")
+        if c == "0":
+            return
+        if c == "1":
+            tun_create()
+        elif c == "2" and names:
+            v = ask("Tunnel # or name", default="1")
+            if v in names:
+                tun_manage(v)
+            elif v.isdigit() and 1 <= int(v) <= len(names):
+                tun_manage(names[int(v) - 1])
+        elif c in ("3", "4", "5"):
+            st = load_state()
+            for n in names:
+                x = st["tunnels"][n]
+                if c == "3":
+                    tun_start(n, x)
+                elif c == "4":
+                    tun_stop(n)
+                    ok(f"{n} stopped")
+                else:
+                    if tun_status(n, x) != "up":
+                        err(f"{n}: not up")
+                        continue
+                    ip, ms = tun_test(x, quiet=True)
+                    if ip:
+                        ok(f"{n}: exit IP [bold green]{ip}[/]  {ms:.0f} ms")
+                    else:
+                        err(f"{n}: request failed")
+            pause()
+        elif c == "6":
+            ext = external_tunnels()
+            if not ext:
+                info("No manual ssh -D tunnels running")
+            for i, (pid, user, args) in enumerate(ext, 1):
+                m = re.search(r"-D\s*(\S+)", args)
+                port = m.group(1).rsplit(":", 1)[-1] if m else "?"
+                works = tun_listening({"bind": "127.0.0.1", "local_port": port}) if port.isdigit() else False
+                console.print(f"   [bold yellow]{i}[/] pid {pid} ({user})  port [cyan]{port}[/]  "
+                              f"{'[green]listening[/]' if works else '[red]not listening[/]'}\n      [grey50]{args}[/]")
+            if ext:
+                v = ask("Number to kill (Enter = keep all)", default="")
+                if v.isdigit() and 1 <= int(v) <= len(ext):
+                    run(["kill", ext[int(v) - 1][0]])
+                    ok("Killed")
+            pause()
+        elif c == "h":
+            ssh_menu()
+
+
+# ════════════════════════════════════════════════════════════════════
 #  7. Network tools
 # ════════════════════════════════════════════════════════════════════
 
@@ -2211,7 +2659,7 @@ def restore_everything():
 def main_menu():
     actions = {
         "1": show_overview, "2": live_all, "3": inspector, "4": packets_menu, "5": ip_manage,
-        "6": mac_menu, "7": wireless_menu, "8": ssh_menu, "9": tools_menu, "r": restore_everything,
+        "6": mac_menu, "7": wireless_menu, "8": tunnels_menu, "9": tools_menu, "r": restore_everything,
     }
     while True:
         c = menu("Main Menu", [
@@ -2225,7 +2673,7 @@ def main_menu():
             ("6", "MAC address changer", "random / vendor / custom / restore"),
             ("7", "Wireless & monitor mode", "monitor on/off with exact restore, scan"),
             (None, "─ Services ─", None),
-            ("8", "SSH proxy manager", "unlimited SSH tunnels, any port/user/pass"),
+            ("8", "SSH tunnel proxies", "SSH to any server → local SOCKS5 on any port"),
             ("9", "Network tools", "public IP, ping, DNS, ports, LAN scan, speed"),
             ("r", "Restore everything", "undo monitor mode + MAC changes"),
             ("0", "Exit", ""),
@@ -2257,7 +2705,7 @@ def elevate():
 def main():
     ap = argparse.ArgumentParser(prog="netforge", description="NetForge – terminal network toolkit")
     ap.add_argument("--restore", action="store_true", help="restore all monitor-mode cards and MAC addresses, then exit")
-    ap.add_argument("--list-proxies", action="store_true", help="print all SSH proxies and exit")
+    ap.add_argument("--list-proxies", action="store_true", help="print all SSH tunnels and exit")
     ap.add_argument("--version", action="version", version=f"NetForge {VERSION}")
     args = ap.parse_args()
     elevate()
@@ -2268,7 +2716,7 @@ def main():
             restore_all_macs()
             return
         if args.list_proxies:
-            t, _ = proxies_table()
+            t, _ = tun_table()
             console.print(t)
             return
         main_menu()

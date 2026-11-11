@@ -21,7 +21,8 @@ SSH proxy manager · Interface inspector · Packet capture · MAC changer · Mon
 | **IP & link management** | Add/remove IPs, DHCP renew, up/down, MTU, default route |
 | **MAC changer** | Random, same-vendor random, custom, restore original / permanent hardware MAC |
 | **Wireless & monitor mode** | Enable/disable monitor mode with **exact state backup & restore**, channel, TX power, injection test, Wi-Fi scan |
-| **SSH proxy manager** | Unlimited SSH tunnel servers on any port with any users/passwords, bulk creation, expiry dates, online sessions, kick, logs, live tunnel test, export list |
+| **SSH tunnel proxies** | SSH from this PC to any server and get a local **SOCKS5 proxy (no auth)** on any port. Unlimited tunnels, password / key / auto-installed key auth, auto-reconnect, start on boot, exit-IP & latency test, optional LAN sharing, detection of manual `ssh -D` tunnels |
+| **Host SSH server mode** | (advanced) run extra SSH servers on this PC with tunnel-only accounts, expiry dates, sessions, export |
 | **Network tools** | Public IP & geo, ping, traceroute/mtr, DNS lookup, listening ports, connections, routes, LAN discovery, TCP port check, speed test |
 | **Restore everything** | One key to undo all monitor-mode and MAC changes |
 
@@ -46,11 +47,23 @@ netforge
 ```bash
 netforge                 # interactive menu
 sudo netforge --restore  # restore all monitor-mode cards and MAC addresses
-netforge --list-proxies  # print all SSH proxies
+netforge --list-proxies  # print all SSH tunnels
 netforge --version
 ```
 
-## 🔐 SSH proxy design
+## 🧦 SSH tunnel proxies
+
+Menu **8** → **New tunnel**: enter server address, SSH port, username and password (or key).
+NetForge runs `ssh -N -D` as a systemd service (`netforge-tunnel-<name>.service`) that reconnects automatically and starts on boot.
+
+```bash
+curl --socks5-hostname 127.0.0.1:1080 https://api.ipify.org   # test
+export ALL_PROXY=socks5h://127.0.0.1:1080                      # use in terminal
+```
+
+Passwords are stored root-only in `/var/lib/netforge/tunnels/`. Choose *NetForge key* to install an SSH key on the server once and stop storing the password.
+
+## 🔐 Host SSH server mode
 
 - Each proxy is an independent `sshd` instance (`netforge-sshd@<port>.service`) that starts on boot.
 - Proxy users have no shell (`/bin/false`), no TTY, tunnel-only (`ssh -N -D`).
