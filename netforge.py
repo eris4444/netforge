@@ -42,7 +42,7 @@ except ImportError:
     print("NetForge needs the 'rich' library:  sudo apt install python3-rich")
     sys.exit(1)
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 STATE_DIR = "/var/lib/netforge"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 CAPTURE_DIR = os.path.join(STATE_DIR, "captures")
@@ -197,7 +197,7 @@ def menu(title, options, color=ACCENT, subtitle=None):
         if key is None:
             t.add_row("", Text(label, style=f"bold {ACCENT2}"), "")
             continue
-        t.add_row(f"[{key}]", label, desc)
+        t.add_row(Text(f"[{key}]", style=f"bold {color}"), label, desc)
     console.print(Align.center(Panel(t, title=f"[bold {color}]{title}[/]", border_style=color, padding=(1, 2))))
     keys = [k for k, _, _ in options if k is not None]
     while True:
@@ -2311,7 +2311,8 @@ def tunnels_menu():
             console.print(Align.center(Text(f"⚠ {len(ext)} manual ssh -D tunnel(s) running outside NetForge (see [6])",
                                             style="yellow")))
         c = menu_inline([("1", "New tunnel"), ("2", "Manage"), ("3", "Start all"), ("4", "Stop all"),
-                         ("5", "Test all"), ("6", "Manual ssh -D tunnels"), ("h", "Host SSH server mode"),
+                         ("5", "Test all"), ("6", "Manual ssh -D tunnels"), ("b", "obfs4 / Tor bridges"),
+                         ("h", "Host SSH server mode"),
                          ("0", "Back")], color="green")
         if c == "0":
             return
@@ -2358,6 +2359,8 @@ def tunnels_menu():
                     run(["kill", ext[int(v) - 1][0]])
                     ok("Killed")
             pause()
+        elif c == "b":
+            obfs4_menu()
         elif c == "h":
             ssh_menu()
 
