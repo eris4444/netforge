@@ -5,7 +5,7 @@ C='\033[1;36m'; G='\033[1;32m'; R='\033[1;31m'; N='\033[0m'
 [ "$(id -u)" -eq 0 ] || { echo -e "${R}Run with sudo:${N} sudo ./install.sh"; exit 1; }
 DIR="$(cd "$(dirname "$0")" && pwd)"
 echo -e "${C}[*] Installing dependencies...${N}"
-PKGS="python3 python3-rich iproute2 iw ethtool tcpdump openssh-server openssh-client curl dnsutils traceroute iputils-ping"
+PKGS="python3 python3-rich iproute2 iw ethtool tcpdump openssh-server openssh-client curl dnsutils traceroute iputils-ping tor obfs4proxy"
 MISSING=""
 for p in $PKGS; do dpkg -s "$p" >/dev/null 2>&1 || MISSING="$MISSING $p"; done
 if [ -n "$MISSING" ]; then apt-get update -qq && apt-get install -y $MISSING; fi

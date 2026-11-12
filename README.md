@@ -22,6 +22,7 @@ SSH proxy manager · Interface inspector · Packet capture · MAC changer · Mon
 | **MAC changer** | Random, same-vendor random, custom, restore original / permanent hardware MAC |
 | **Wireless & monitor mode** | Enable/disable monitor mode with **exact state backup & restore**, channel, TX power, injection test, Wi-Fi scan |
 | **SSH tunnel proxies** | SSH from this PC to any server and get a local **SOCKS5 proxy (no auth)** on any port. Unlimited tunnels, password / key / auto-installed key auth, auto-reconnect, start on boot, exit-IP & latency test, optional LAN sharing, detection of manual `ssh -D` tunnels |
+| **obfs4 proxies** | **Tor + obfs4 bridges** → local SOCKS5 (+ optional HTTP proxy, exit country) with live bootstrap progress · **Own obfs4 server** → local proxy, or an SSH tunnel carried over obfs4 · **obfs4 server mode** to wrap SSH/SOCKS on your own server and print the client connection line |
 | **Host SSH server mode** | (advanced) run extra SSH servers on this PC with tunnel-only accounts, expiry dates, sessions, export |
 | **Network tools** | Public IP & geo, ping, traceroute/mtr, DNS lookup, listening ports, connections, routes, LAN discovery, TCP port check, speed test |
 | **Restore everything** | One key to undo all monitor-mode and MAC changes |
@@ -62,6 +63,20 @@ export ALL_PROXY=socks5h://127.0.0.1:1080                      # use in terminal
 ```
 
 Passwords are stored root-only in `/var/lib/netforge/tunnels/`. Choose *NetForge key* to install an SSH key on the server once and stop storing the password.
+
+## 🧅 obfs4
+
+Menu **o**:
+
+| Mode | You give | You get |
+|---|---|---|
+| Tor + obfs4 bridges | `obfs4 IP:PORT FINGERPRINT cert=… iat-mode=0` lines (bridges.torproject.org, Telegram @GetBridgesBot) | SOCKS5 on `127.0.0.1:<port>` (+ HTTP proxy) |
+| Own obfs4 server | `obfs4 SERVER:PORT cert=… iat-mode=0` | SOCKS/HTTP of the server directly, or an SSH tunnel (menu 8) running over obfs4 |
+| Server mode | public port + local target (e.g. `127.0.0.1:22`) | obfs4 listener and the connection line for clients |
+
+Typical setup: run **server mode** on your VPS in front of SSH → on your PC choose **Own obfs4 server → SSH** → local SOCKS5 with traffic disguised by obfs4.
+
+Uses `obfs4proxy` (or `lyrebird`) and `tor`; everything runs as auto-restarting systemd services.
 
 ## 🔐 Host SSH server mode
 

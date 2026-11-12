@@ -42,7 +42,7 @@ except ImportError:
     print("NetForge needs the 'rich' library:  sudo apt install python3-rich")
     sys.exit(1)
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 STATE_DIR = "/var/lib/netforge"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 CAPTURE_DIR = os.path.join(STATE_DIR, "captures")
@@ -123,6 +123,7 @@ def load_state():
     st.setdefault("monitor", {})
     st.setdefault("orig_mac", {})
     st.setdefault("tunnels", {})
+    st.setdefault("obfs4", {})
     return st
 
 
@@ -1964,9 +1965,9 @@ def tun_write_unit(name, t):
     if t["auth"] == "password":
         env = "\n".join(f"Environment={k}={v}" for k, v in tun_env(tun_passfile(name)).items())
     unit = f"""[Unit]
-Description=NetForge SSH tunnel {name} ({t['user']}@{t['host']} -> socks {t['bind']}:{t['local_port']})
-After=network-online.target
-Wants=network-online.target
+Description=NetForge SSH tunnel {name} ({t['user']}@{t.get('label') or t['host']} -> socks {t['bind']}:{t['local_port']})
+After=network-online.target {t.get('after') or ''}
+Wants=network-online.target {t.get('after') or ''}
 StartLimitIntervalSec=0
 
 [Service]
@@ -2111,22 +2112,32 @@ def tun_ask_auth(t, name):
     return True
 
 
-def tun_create():
-    header("New SSH Tunnel Proxy")
+def tun_create(preset=None):
+    if not preset:
+        header("New SSH Tunnel Proxy")
     tun_prepare()
     st = load_state()
-    while True:
-        name = ask("Tunnel name (e.g. germany1)")
-        if not NAME_RE.match(name):
-            err("Use letters, digits, - and _ only")
-        elif name in st["tunnels"]:
-            err("Name already exists")
-        else:
-            break
-    t = {"host": ask("Server address (IP or domain)")}
-    t["ssh_port"] = ask_int("Server SSH port", default=22, lo=1, hi=65535)
+    if preset:
+        name = preset["name"]
+        if name in st["tunnels"]:
+            tun_delete(name, ask_confirm=False)
+            st = load_state()
+        t = {"host": preset["host"], "ssh_port": preset["ssh_port"], "after": preset.get("after"),
+             "label": preset.get("label")}
+    else:
+        while True:
+            name = ask("Tunnel name (e.g. germany1)")
+            if not NAME_RE.match(name):
+                err("Use letters, digits, - and _ only")
+            elif name in st["tunnels"]:
+                err("Name already exists")
+            else:
+                break
+        t = {"host": ask("Server address (IP or domain)")}
+        t["ssh_port"] = ask_int("Server SSH port", default=22, lo=1, hi=65535)
     t["user"] = ask("Server username", default="root")
-    used = {int(x["local_port"]) for x in st["tunnels"].values()}
+    used = {int(x["local_port"]) for x in st["tunnels"].values()} | \
+        {int(x.get("local_port") or x.get("port") or 0) for x in st["obfs4"].values()}
     suggest = next(p for p in range(1080, 65000) if p not in used and not port_in_use(p))
     while True:
         lp = ask_int("Local SOCKS port on this PC", default=suggest, lo=1, hi=65535)
@@ -2282,7 +2293,7 @@ def tun_table():
         t.add_row(str(i), Text(n, style="bold white"),
                   Text("● " + s.upper(), style={"up": "bold green", "connecting": "bold yellow"}.get(s, "bold red")),
                   Text(f"127.0.0.1:{x['local_port']}", style="bold cyan"),
-                  f"{x['user']}@{x['host']}:{x['ssh_port']}", x["auth"],
+                  f"{x['user']}@{x['label']}" if x.get("label") else f"{x['user']}@{x['host']}:{x['ssh_port']}", x["auth"],
                   "yes" if x["bind"] == "0.0.0.0" else "-")
     return t, names
 
@@ -2349,6 +2360,647 @@ def tunnels_menu():
             pause()
         elif c == "h":
             ssh_menu()
+
+
+# ════════════════════════════════════════════════════════════════════
+#  6c. obfs4 proxies (Tor bridges / own obfs4 server / obfs4 server mode)
+# ════════════════════════════════════════════════════════════════════
+
+OBFS_DIR = "/var/lib/netforge-obfs4"
+FPR_RE = re.compile(r"^[0-9A-Fa-f]{40}$")
+
+
+def pt_bin():
+    return shutil.which("lyrebird") or shutil.which("obfs4proxy") or "/usr/bin/obfs4proxy"
+
+
+def ob_unit(name):
+    return f"netforge-obfs4-{name}.service"
+
+
+def ob_unit_path(name):
+    return f"/etc/systemd/system/{ob_unit(name)}"
+
+
+def ob_dir(name):
+    return os.path.join(OBFS_DIR, name)
+
+
+def parse_bridge(line):
+    """Parse 'Bridge obfs4 IP:PORT [FPR] cert=.. iat-mode=..' → dict or None."""
+    tok = line.strip().split()
+    if tok and tok[0].lower() == "bridge":
+        tok = tok[1:]
+    if tok and tok[0].lower() == "obfs4":
+        tok = tok[1:]
+    if not tok:
+        return None
+    addr = tok[0]
+    m = re.match(r"^\[?([^\]]+?)\]?:(\d+)$", addr)
+    if not m:
+        return None
+    b = {"host": m.group(1), "port": int(m.group(2)), "fingerprint": None, "args": {}}
+    for t in tok[1:]:
+        if FPR_RE.match(t):
+            b["fingerprint"] = t.upper()
+        elif "=" in t:
+            k, v = t.split("=", 1)
+            b["args"][k] = v
+    if "cert" not in b["args"]:
+        return None
+    b["args"].setdefault("iat-mode", "0")
+    return b
+
+
+def bridge_line(b):
+    host = f"[{b['host']}]" if ":" in b["host"] else b["host"]
+    parts = ["obfs4", f"{host}:{b['port']}"]
+    if b.get("fingerprint"):
+        parts.append(b["fingerprint"])
+    parts += [f"{k}={v}" for k, v in b["args"].items()]
+    return " ".join(parts)
+
+
+# ───────────── obfs4 client forwarder (runs as a systemd service) ─────────────
+
+def pt_socks_auth(args):
+    def esc(s):
+        return s.replace("\\", "\\\\").replace(";", "\\;").replace("=", "\\=")
+    raw = ";".join(f"{esc(k)}={esc(v)}" for k, v in args.items()).encode()
+    if len(raw) <= 255:
+        return raw, b"\x00"
+    return raw[:255], raw[255:]
+
+
+def run_forwarder(p, statedir):
+    """Local plain TCP port  ⇄  obfs4 (via obfs4proxy client)  ⇄  remote server."""
+    import asyncio
+    import threading
+    os.makedirs(statedir, mode=0o700, exist_ok=True)
+    env = dict(os.environ, TOR_PT_MANAGED_TRANSPORT_VER="1", TOR_PT_CLIENT_TRANSPORTS="obfs4",
+               TOR_PT_STATE_LOCATION=statedir, TOR_PT_EXIT_ON_STDIN_CLOSE="1")
+    proc = subprocess.Popen([pt_bin(), "-enableLogging", "-logLevel", "WARN"], env=env,
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    socks = None
+    for line in proc.stdout:
+        line = line.strip()
+        print("pt:", line, flush=True)
+        if line.startswith("CMETHOD obfs4 socks5"):
+            socks = line.split()[3]
+        elif "ERROR" in line:
+            sys.exit(1)
+        elif line == "CMETHODS DONE":
+            break
+    if not socks:
+        print("obfs4proxy did not offer a SOCKS listener", flush=True)
+        sys.exit(1)
+    sh, sp = socks.rsplit(":", 1)
+    b = p["bridge"]
+    dst_ip = socket.getaddrinfo(b["host"], b["port"], proto=socket.IPPROTO_TCP)[0][4][0]
+    auth = pt_socks_auth(b["args"])
+    threading.Thread(target=lambda: (proc.wait(), print("obfs4proxy exited", flush=True), os._exit(1)),
+                     daemon=True).start()
+
+    async def pt_connect():
+        r, w = await asyncio.open_connection(sh, int(sp))
+        w.write(b"\x05\x01\x02")
+        await w.drain()
+        if await r.readexactly(2) != b"\x05\x02":
+            raise ConnectionError("PT refused SOCKS auth method")
+        u, pw = auth
+        w.write(b"\x01" + bytes([len(u)]) + u + bytes([len(pw)]) + pw)
+        await w.drain()
+        if (await r.readexactly(2))[1] != 0:
+            raise ConnectionError("PT rejected obfs4 arguments (bad cert?)")
+        ip = ipaddress.ip_address(dst_ip)
+        w.write(b"\x05\x01\x00" + (b"\x01" if ip.version == 4 else b"\x04") + ip.packed + int(b["port"]).to_bytes(2, "big"))
+        await w.drain()
+        hdr = await r.readexactly(4)
+        if hdr[1] != 0:
+            raise ConnectionError(f"obfs4 handshake/connect failed (SOCKS code {hdr[1]})")
+        alen = {1: 4, 4: 16}.get(hdr[3]) or (await r.readexactly(1))[0]
+        await r.readexactly(alen + 2)
+        return r, w
+
+    async def pipe(r, w):
+        try:
+            while True:
+                data = await r.read(65536)
+                if not data:
+                    break
+                w.write(data)
+                await w.drain()
+        except Exception:
+            pass
+        finally:
+            try:
+                if w.can_write_eof():
+                    w.write_eof()
+            except Exception:
+                pass
+
+    async def handle(cr, cw):
+        try:
+            sr, sw = await asyncio.wait_for(pt_connect(), 30)
+        except Exception as e:
+            print(f"connect error: {e}", flush=True)
+            cw.close()
+            return
+        await asyncio.gather(pipe(cr, sw), pipe(sr, cw))
+        for w in (cw, sw):
+            try:
+                w.close()
+            except Exception:
+                pass
+
+    async def main():
+        srv = await asyncio.start_server(handle, p["bind"], int(p["local_port"]))
+        print(f"listening on {p['bind']}:{p['local_port']} → obfs4 {b['host']}:{b['port']}", flush=True)
+        async with srv:
+            await srv.serve_forever()
+
+    asyncio.run(main())
+
+
+def obfs4_forward_main(name):
+    p = load_state()["obfs4"].get(name)
+    if not p:
+        print(f"unknown obfs4 profile {name}", flush=True)
+        sys.exit(2)
+    run_forwarder(p, os.path.join(ob_dir(name), "pt"))
+
+
+# ───────────── unit / config writers ─────────────
+
+def tor_user():
+    return "debian-tor" if user_exists("debian-tor") else "root"
+
+
+def write_torrc(name, p, path, datadir):
+    lines = [f"DataDirectory {datadir}", f"SocksPort {p['bind']}:{p['local_port']}",
+             "UseBridges 1", f"ClientTransportPlugin obfs4 exec {pt_bin()}", "Log notice stdout", "AvoidDiskWrites 1"]
+    if p.get("http_port"):
+        lines.append(f"HTTPTunnelPort {p['bind']}:{p['http_port']}")
+    if p["bind"] != "127.0.0.1":
+        lines.append("SocksPolicy accept 127.0.0.0/8, accept 10.0.0.0/8, accept 172.16.0.0/12, accept 192.168.0.0/16, reject *")
+    if p.get("exit_country"):
+        cc = ",".join("{%s}" % c.strip().lower() for c in p["exit_country"].split(",") if c.strip())
+        lines += [f"ExitNodes {cc}", "StrictNodes 1"]
+    lines += [f"Bridge {bl}" for bl in p["bridges"]]
+    with open(path, "w") as f:
+        f.write("# Generated by NetForge\n" + "\n".join(lines) + "\n")
+
+
+def ob_write_unit(name, p):
+    d = ob_dir(name)
+    os.makedirs(OBFS_DIR, mode=0o755, exist_ok=True)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    common = "Restart=always\nRestartSec=5\nNoNewPrivileges=yes\nPrivateTmp=yes\n"
+    if p["type"] == "tor":
+        user = tor_user()
+        datadir = os.path.join(d, "tor")
+        os.makedirs(datadir, mode=0o700, exist_ok=True)
+        torrc = os.path.join(d, "torrc")
+        write_torrc(name, p, torrc, datadir)
+        if user != "root":
+            run(["chown", "-R", f"{user}:", d])
+        rc, out, e = run(["tor", "--verify-config", "-f", torrc, "--DataDirectory", "/tmp/nf-verify-" + name])
+        shutil.rmtree("/tmp/nf-verify-" + name, ignore_errors=True)
+        if rc != 0:
+            err("torrc check failed: " + (out + e).strip().splitlines()[-1][:300])
+            return False
+        svc = f"User={user}\nExecStart={shutil.which('tor') or '/usr/sbin/tor'} -f {torrc} --RunAsDaemon 0\n{common}"
+        desc = f"Tor via {len(p['bridges'])} obfs4 bridge(s) -> socks {p['bind']}:{p['local_port']}"
+    elif p["type"] == "direct":
+        script = os.path.realpath(__file__)
+        svc = (f"ExecStart={sys.executable} {script} --obfs4-forward {name}\n{common}"
+               f"ProtectSystem=strict\nProtectHome=read-only\nReadWritePaths={d}\n")
+        desc = f"obfs4 client {p['bridge']['host']}:{p['bridge']['port']} -> local {p['bind']}:{p['local_port']}"
+    else:  # server
+        pt = os.path.join(d, "pt")
+        os.makedirs(pt, mode=0o700, exist_ok=True)
+        env = {"TOR_PT_MANAGED_TRANSPORT_VER": "1", "TOR_PT_SERVER_TRANSPORTS": "obfs4",
+               "TOR_PT_SERVER_BINDADDR": f"obfs4-{p['bind']}:{p['port']}", "TOR_PT_ORPORT": p["target"],
+               "TOR_PT_EXTENDED_SERVER_PORT": "", "TOR_PT_STATE_LOCATION": pt,
+               "TOR_PT_SERVER_TRANSPORT_OPTIONS": f"obfs4:iat-mode={p.get('iat', '0')}"}
+        envs = "\n".join(f"Environment={k}={v}" for k, v in env.items())
+        svc = (f"{envs}\nExecStart={pt_bin()} -enableLogging -logLevel INFO\n{common}"
+               f"ProtectSystem=strict\nProtectHome=yes\nReadWritePaths={d}\n")
+        desc = f"obfs4 server {p['bind']}:{p['port']} -> {p['target']}"
+    unit = (f"[Unit]\nDescription=NetForge {desc}\nAfter=network-online.target\nWants=network-online.target\n"
+            f"StartLimitIntervalSec=0\n\n[Service]\n{svc}\n[Install]\nWantedBy=multi-user.target\n")
+    with open(ob_unit_path(name), "w") as f:
+        f.write(unit)
+    run(["systemctl", "daemon-reload"])
+    return True
+
+
+# ───────────── status / start / test ─────────────
+
+def ob_listen_port(p):
+    return p["port"] if p["type"] == "server" else p["local_port"]
+
+
+def tor_bootstrap(name):
+    inv = run(["systemctl", "show", "-p", "InvocationID", "--value", ob_unit(name)])[1].strip()
+    if not inv:
+        return 0, ""
+    rc, out, _ = run(["journalctl", f"_SYSTEMD_INVOCATION_ID={inv}", "-o", "cat", "--no-pager"])
+    pct, msg = 0, ""
+    for line in out.splitlines():
+        m = re.search(r"Bootstrapped (\d+)%[^:]*: (.*)", line)
+        if m:
+            pct, msg = int(m.group(1)), m.group(2)
+    return pct, msg
+
+
+def ob_status(name, p):
+    if not svc_active(ob_unit(name)):
+        return "stopped"
+    if not tun_listening({"bind": p["bind"], "local_port": ob_listen_port(p)}):
+        return "starting"
+    if p["type"] == "tor":
+        pct, _ = tor_bootstrap(name)
+        return "up" if pct >= 100 else f"boot {pct}%"
+    return "up"
+
+
+def ob_start(name, p):
+    run(["systemctl", "enable", ob_unit(name)])
+    run(["systemctl", "restart", ob_unit(name)])
+    if p["type"] == "tor":
+        from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
+        info("Tor is connecting through the bridges (can take 10–120 s, Ctrl+C = leave it running in background)")
+        try:
+            with Progress(TextColumn("  [bold cyan]{task.description}"), BarColumn(bar_width=40, complete_style="green"),
+                          TextColumn("[bold]{task.percentage:>3.0f}%"), TimeElapsedColumn(), console=console) as pr:
+                task = pr.add_task("bootstrap", total=100)
+                for _ in range(360):
+                    time.sleep(0.5)
+                    pct, msg = tor_bootstrap(name)
+                    pr.update(task, completed=pct, description=(msg or "starting")[:45])
+                    if pct >= 100 or not svc_active(ob_unit(name)):
+                        break
+        except KeyboardInterrupt:
+            warn("Still bootstrapping in background")
+            return False
+        if tor_bootstrap(name)[0] >= 100:
+            ok(f"[bold]{name}[/] connected → SOCKS5 [bold cyan]{p['bind']}:{p['local_port']}[/]"
+               + (f"  HTTP [bold cyan]{p['bind']}:{p['http_port']}[/]" if p.get("http_port") else ""))
+            return True
+    else:
+        with console.status("[bold cyan]Starting ...", spinner="dots12"):
+            for _ in range(30):
+                time.sleep(0.5)
+                if tun_listening({"bind": p["bind"], "local_port": ob_listen_port(p)}):
+                    break
+        if tun_listening({"bind": p["bind"], "local_port": ob_listen_port(p)}):
+            ok(f"[bold]{name}[/] is running on port [bold cyan]{ob_listen_port(p)}[/]")
+            return True
+    err("Did not come up. Last log lines:")
+    rc, out, _ = run(["journalctl", "-u", ob_unit(name), "-n", "12", "--no-pager", "-o", "cat"])
+    console.print(Text(out.strip() or "(no log)", style="red"))
+    return False
+
+
+def ob_test(name, p):
+    if p["type"] == "server":
+        info("Server mode: test it from a client with the connection line")
+        return
+    if p["type"] == "direct" and p.get("behind") == "ssh":
+        info(f"This is the obfs4 transport for SSH tunnel '{p.get('tunnel')}'. Test that tunnel in menu 8.")
+        return
+    with console.status("[bold cyan]Testing through the proxy ...", spinner="dots"):
+        ip, ms = tun_test({"bind": p["bind"], "local_port": p["local_port"]}, quiet=True)
+    if ip:
+        ok(f"Proxy works – exit IP [bold green]{ip}[/]  latency [bold yellow]{ms:.0f} ms[/]")
+    else:
+        err("Request through the proxy failed")
+
+
+def ob_server_line(name, p):
+    bl = read_file(os.path.join(ob_dir(name), "pt", "obfs4_bridgeline.txt"))
+    m = re.search(r"cert=(\S+)", bl)
+    if not m:
+        return None
+    host = public_ip() or local_ip()
+    return f"obfs4 {host}:{p['port']} cert={m.group(1)} iat-mode={p.get('iat', '0')}"
+
+
+def ob_usage(name, p):
+    if p["type"] == "server":
+        line = ob_server_line(name, p)
+        body = Group(
+            Text.assemble(("Listening ", f"bold {ACCENT}"), (f"{p['bind']}:{p['port']}", "bold white"),
+                          ("  →  forwards to ", DIM), (p["target"], "bold white")),
+            Text(""), Text("Connection line for clients (NetForge → obfs4 → 'Own obfs4 server'):", style=f"bold {ACCENT2}"),
+            Text(f"  {line or '(not generated yet – start the server first)'}", style="bold green"),
+            Text(""), Text(f"Open TCP port {p['port']} in your firewall / cloud panel.", style=DIM))
+        return Panel(body, title="[bold green]obfs4 server[/]", border_style="green", padding=(1, 2))
+    if p["type"] == "direct" and p.get("behind") == "ssh":
+        return Panel(Text(f"Transport for SSH tunnel '{p.get('tunnel')}' – use that tunnel's SOCKS port (menu 8).",
+                          style="cyan"), border_style="green")
+    pan = tun_usage_panel({"bind": p["bind"], "local_port": p["local_port"]})
+    if p.get("http_port"):
+        h = "127.0.0.1" if p["bind"] in ("0.0.0.0", "127.0.0.1") else p["bind"]
+        return Group(pan, Panel(Text(f"HTTP proxy (CONNECT): {h}:{p['http_port']}\n"
+                                     f"  export https_proxy=http://{h}:{p['http_port']}", style="cyan"),
+                                border_style="green"))
+    return pan
+
+
+# ───────────── creation wizards ─────────────
+
+def ask_bind_and_port(st, default_start):
+    used = {int(x.get("local_port") or x.get("port") or 0) for x in st["obfs4"].values()} | \
+           {int(x["local_port"]) for x in st["tunnels"].values()}
+    suggest = next(q for q in range(default_start, 65000) if q not in used and not port_in_use(q))
+    while True:
+        lp = ask_int("Local proxy port on this PC", default=suggest, lo=1, hi=65535)
+        if lp in used or port_in_use(lp):
+            err("Port is busy")
+        else:
+            break
+    bind = "0.0.0.0" if confirm("Share with other devices on your LAN?", False) else "127.0.0.1"
+    return lp, bind, used
+
+
+def ask_ob_name(st):
+    while True:
+        name = ask("Profile name (e.g. bridges1)")
+        if not NAME_RE.match(name):
+            err("Use letters, digits, - and _ only")
+        elif name in st["obfs4"]:
+            err("Name already exists")
+        else:
+            return name
+
+
+def ob_save_and_start(name, p):
+    st = load_state()
+    st["obfs4"][name] = p
+    save_state(st)
+    if not ob_write_unit(name, p):
+        return False
+    up = ob_start(name, p)
+    if up:
+        ob_test(name, p)
+    console.print(ob_usage(name, p))
+    return up
+
+
+def ob_create_tor():
+    header("obfs4 — Tor with bridges")
+    if not need("tor") or not (has("lyrebird") or has("obfs4proxy") or need("obfs4proxy")):
+        return pause()
+    st = load_state()
+    name = ask_ob_name(st)
+    console.print(f"  [{DIM}]Paste obfs4 bridge lines one per line (from bridges.torproject.org, Telegram @GetBridgesBot,\n"
+                  f"  or email bridges@torproject.org). Empty line to finish.[/]")
+    bridges = []
+    while True:
+        line = Prompt.ask("  [bold cyan]bridge[/]", default="", show_default=False).strip()
+        if not line:
+            break
+        b = parse_bridge(line)
+        if not b or not b["fingerprint"]:
+            err("Not a valid obfs4 bridge line (needs IP:PORT FINGERPRINT cert=... iat-mode=...)")
+            continue
+        bridges.append(bridge_line(b))
+        ok(f"bridge {b['host']}:{b['port']} added")
+    if not bridges:
+        err("No bridges – cancelled")
+        return pause()
+    lp, bind, used = ask_bind_and_port(st, 9150)
+    http = None
+    if confirm("Also open an HTTP proxy port (for apps without SOCKS support)?", False):
+        http = next(q for q in range(lp + 1, 65000) if q not in used and not port_in_use(q))
+        http = ask_int("HTTP proxy port", default=http, lo=1, hi=65535)
+    cc = ask("Exit country codes, e.g. de,nl (empty = any)", default="")
+    p = {"type": "tor", "bridges": bridges, "local_port": lp, "bind": bind, "http_port": http,
+         "exit_country": cc, "created": dt.datetime.now().isoformat(timespec="seconds")}
+    ob_save_and_start(name, p)
+    pause()
+
+
+def ob_create_direct():
+    header("obfs4 — Own obfs4 server")
+    if not (has("lyrebird") or has("obfs4proxy") or need("obfs4proxy")):
+        return pause()
+    st = load_state()
+    name = ask_ob_name(st)
+    console.print(f"  [{DIM}]Format:  obfs4 SERVER:PORT cert=XXXXXXXX iat-mode=0   (NetForge server mode prints this line)[/]")
+    while True:
+        b = parse_bridge(ask("Connection line"))
+        if b:
+            break
+        err("Invalid line – it needs at least SERVER:PORT and cert=...")
+    console.print(f"  [{DIM}]What runs behind obfs4 on the server?[/]")
+    behind = menu_inline([("1", "SOCKS5/HTTP proxy (use directly)"), ("2", "SSH server (build SSH tunnel over it)")])
+    p = {"type": "direct", "bridge": b, "created": dt.datetime.now().isoformat(timespec="seconds")}
+    if behind == "1":
+        lp, bind, _ = ask_bind_and_port(st, 1090)
+        p.update(local_port=lp, bind=bind, behind="socks")
+        ob_save_and_start(name, p)
+        return pause()
+    # SSH behind obfs4: internal forward port on 127.0.0.1, then SSH tunnel through it
+    used = {int(x.get("local_port") or x.get("port") or 0) for x in st["obfs4"].values()}
+    fwd = next(q for q in range(42000, 65000) if q not in used and not port_in_use(q))
+    p.update(local_port=fwd, bind="127.0.0.1", behind="ssh", tunnel=name)
+    st["obfs4"][name] = p
+    save_state(st)
+    if not ob_write_unit(name, p) or not ob_start(name, p):
+        return pause()
+    info(f"obfs4 transport ready on 127.0.0.1:{fwd} – now the SSH login for the server")
+    tun_create(preset={"name": name, "host": "127.0.0.1", "ssh_port": fwd, "after": ob_unit(name),
+                       "label": f"{b['host']}:{b['port']} via obfs4"})
+
+
+def ob_create_server():
+    header("obfs4 — Server mode (this machine)")
+    if not (has("lyrebird") or has("obfs4proxy") or need("obfs4proxy")):
+        return pause()
+    st = load_state()
+    name = ask_ob_name(st)
+    used = {int(x.get("local_port") or x.get("port") or 0) for x in st["obfs4"].values()}
+    while True:
+        port = ask_int("Public obfs4 port", default=random.randint(20000, 60000), lo=1, hi=65535)
+        if port in used or port_in_use(port):
+            err("Port is busy")
+        else:
+            break
+    target = ask("Forward to (local service: SSH or a SOCKS server)", default="127.0.0.1:22")
+    iat = ask("iat-mode (0 = fast, 1/2 = more padding, slower)", default="0")
+    p = {"type": "server", "port": port, "bind": "0.0.0.0", "target": target, "iat": iat if iat in "012" else "0",
+         "created": dt.datetime.now().isoformat(timespec="seconds")}
+    st["obfs4"][name] = p
+    save_state(st)
+    if ob_write_unit(name, p) and ob_start(name, p):
+        open_firewall(port)
+        for _ in range(10):
+            if ob_server_line(name, p):
+                break
+            time.sleep(0.5)
+        console.print(ob_usage(name, p))
+    pause()
+
+
+def ob_delete(name):
+    if not confirm(f"Delete obfs4 profile {name}?"):
+        return
+    st = load_state()
+    p = st["obfs4"].get(name, {})
+    if p.get("behind") == "ssh" and p.get("tunnel") in st["tunnels"]:
+        tun_delete(p["tunnel"], ask_confirm=False)
+    run(["systemctl", "disable", "--now", ob_unit(name)])
+    for f in (ob_unit_path(name),):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    shutil.rmtree(ob_dir(name), ignore_errors=True)
+    run(["systemctl", "daemon-reload"])
+    if p.get("type") == "server":
+        open_firewall(p["port"], close=True)
+    st = load_state()
+    st["obfs4"].pop(name, None)
+    save_state(st)
+    ok(f"{name} deleted")
+
+
+def ob_manage(name):
+    while True:
+        st = load_state()
+        p = st["obfs4"].get(name)
+        if not p:
+            return
+        header(f"obfs4 — {name}")
+        s = ob_status(name, p)
+        g = Table.grid(padding=(0, 2))
+        g.add_column(style=f"bold {ACCENT}", justify="right")
+        g.add_column(style="white")
+        g.add_row("Status", Text(s.upper(), style="bold green" if s == "up" else "bold red" if s == "stopped" else "bold yellow"))
+        g.add_row("Type", {"tor": "Tor + obfs4 bridges", "direct": "own obfs4 server", "server": "obfs4 server (this machine)"}[p["type"]])
+        if p["type"] == "tor":
+            for bl in p["bridges"]:
+                g.add_row("Bridge", Text(bl[:90] + ("…" if len(bl) > 90 else ""), style=DIM))
+            if p.get("exit_country"):
+                g.add_row("Exit country", p["exit_country"])
+        elif p["type"] == "direct":
+            g.add_row("Server", f"{p['bridge']['host']}:{p['bridge']['port']}  (behind: {p.get('behind')})")
+        else:
+            g.add_row("Forward to", p["target"])
+        g.add_row("Port", Text(f"{p['bind']}:{ob_listen_port(p)}", style="bold cyan"))
+        if p.get("http_port"):
+            g.add_row("HTTP port", Text(f"{p['bind']}:{p['http_port']}", style="bold cyan"))
+        console.print(Align.center(Panel(g, border_style=ACCENT, title=f"[bold]{name}[/]", padding=(1, 3))))
+        opts = [("1", "Start/Restart"), ("2", "Stop"), ("3", "Test"), ("4", "How to use / connection line"), ("l", "Logs")]
+        if p["type"] == "tor":
+            opts += [("5", "Edit bridges"), ("6", "New identity (new circuit)")]
+        opts += [("x", "Delete"), ("0", "Back")]
+        c = menu_inline(opts, color="yellow")
+        if c == "0":
+            return
+        if c == "1":
+            ob_start(name, p)
+        elif c == "2":
+            run(["systemctl", "disable", "--now", ob_unit(name)])
+            ok("Stopped")
+        elif c == "3":
+            ob_test(name, p)
+        elif c == "4":
+            console.print(ob_usage(name, p))
+        elif c == "l":
+            rc, out, _ = run(["journalctl", "-u", ob_unit(name), "-n", "40", "--no-pager", "-o", "short-iso"])
+            for line in out.splitlines():
+                st_ = "red" if re.search(r"warn|err|fail", line, re.I) else "green" if "Bootstrapped 100" in line else DIM
+                console.print(Text(line, style=st_))
+        elif c == "5" and p["type"] == "tor":
+            for i, bl in enumerate(p["bridges"], 1):
+                console.print(f"   [bold yellow]{i}[/] {bl[:100]}")
+            v = ask("'a' = add bridges, 'd<num>' = delete one, Enter = back", default="")
+            if v == "a":
+                while True:
+                    line = Prompt.ask("  [bold cyan]bridge[/]", default="", show_default=False).strip()
+                    if not line:
+                        break
+                    b = parse_bridge(line)
+                    if b and b["fingerprint"]:
+                        p["bridges"].append(bridge_line(b))
+                        ok("added")
+                    else:
+                        err("invalid bridge line")
+            elif v.startswith("d") and v[1:].isdigit() and 1 <= int(v[1:]) <= len(p["bridges"]) and len(p["bridges"]) > 1:
+                p["bridges"].pop(int(v[1:]) - 1)
+            else:
+                continue
+            st["obfs4"][name] = p
+            save_state(st)
+            if ob_write_unit(name, p):
+                ob_start(name, p)
+        elif c == "6" and p["type"] == "tor":
+            run(["systemctl", "kill", "-s", "HUP", ob_unit(name)])
+            ok("Tor reloaded – new circuits will be used for new connections")
+        elif c == "x":
+            ob_delete(name)
+            pause()
+            return
+        pause()
+
+
+def ob_table():
+    st = load_state()
+    t = Table(box=box.ROUNDED, border_style="yellow", header_style="bold yellow")
+    for c in ["#", "Name", "Type", "Status", "Port", "Details"]:
+        t.add_column(c)
+    names = sorted(st["obfs4"])
+    for i, n in enumerate(names, 1):
+        p = st["obfs4"][n]
+        s = ob_status(n, p)
+        typ = {"tor": "Tor+bridges", "direct": "own server", "server": "SERVER"}[p["type"]]
+        if p["type"] == "tor":
+            det = f"{len(p['bridges'])} bridge(s)" + (f", HTTP :{p['http_port']}" if p.get("http_port") else "")
+        elif p["type"] == "direct":
+            det = f"{p['bridge']['host']}:{p['bridge']['port']}" + (f" → ssh tunnel '{p['tunnel']}'" if p.get("behind") == "ssh" else "")
+        else:
+            det = f"→ {p['target']}"
+        t.add_row(str(i), Text(n, style="bold white"), typ,
+                  Text("● " + s.upper(), style="bold green" if s == "up" else "bold red" if s == "stopped" else "bold yellow"),
+                  Text(f"{p['bind']}:{ob_listen_port(p)}", style="bold cyan"), Text(det, style=DIM))
+    return t, names
+
+
+def obfs4_menu():
+    while True:
+        header("obfs4 Proxies")
+        t, names = ob_table()
+        console.print(Align.center(t if names else Text("No obfs4 profiles yet", style="yellow")))
+        c = menu_inline([("1", "Tor + obfs4 bridges"), ("2", "Own obfs4 server"), ("3", "Server mode (this PC)"),
+                         ("4", "Manage"), ("5", "Start all"), ("6", "Stop all"), ("0", "Back")], color="yellow")
+        if c == "0":
+            return
+        if c == "1":
+            ob_create_tor()
+        elif c == "2":
+            ob_create_direct()
+            pause()
+        elif c == "3":
+            ob_create_server()
+        elif c == "4" and names:
+            v = ask("Profile # or name", default="1")
+            if v in names:
+                ob_manage(v)
+            elif v.isdigit() and 1 <= int(v) <= len(names):
+                ob_manage(names[int(v) - 1])
+        elif c in ("5", "6"):
+            st = load_state()
+            for n in names:
+                if c == "5":
+                    ob_start(n, st["obfs4"][n])
+                else:
+                    run(["systemctl", "disable", "--now", ob_unit(n)])
+                    ok(f"{n} stopped")
+            pause()
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -2659,7 +3311,7 @@ def restore_everything():
 def main_menu():
     actions = {
         "1": show_overview, "2": live_all, "3": inspector, "4": packets_menu, "5": ip_manage,
-        "6": mac_menu, "7": wireless_menu, "8": tunnels_menu, "9": tools_menu, "r": restore_everything,
+        "6": mac_menu, "7": wireless_menu, "8": tunnels_menu, "o": obfs4_menu, "9": tools_menu, "r": restore_everything,
     }
     while True:
         c = menu("Main Menu", [
@@ -2674,6 +3326,7 @@ def main_menu():
             ("7", "Wireless & monitor mode", "monitor on/off with exact restore, scan"),
             (None, "─ Services ─", None),
             ("8", "SSH tunnel proxies", "SSH to any server → local SOCKS5 on any port"),
+            ("o", "obfs4 proxies", "Tor bridges / own obfs4 server → local proxy, or obfs4 server"),
             ("9", "Network tools", "public IP, ping, DNS, ports, LAN scan, speed"),
             ("r", "Restore everything", "undo monitor mode + MAC changes"),
             ("0", "Exit", ""),
@@ -2706,8 +3359,11 @@ def main():
     ap = argparse.ArgumentParser(prog="netforge", description="NetForge – terminal network toolkit")
     ap.add_argument("--restore", action="store_true", help="restore all monitor-mode cards and MAC addresses, then exit")
     ap.add_argument("--list-proxies", action="store_true", help="print all SSH tunnels and exit")
+    ap.add_argument("--obfs4-forward", metavar="NAME", help=argparse.SUPPRESS)
     ap.add_argument("--version", action="version", version=f"NetForge {VERSION}")
     args = ap.parse_args()
+    if args.obfs4_forward:
+        return obfs4_forward_main(args.obfs4_forward)
     elevate()
     os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
     try:
